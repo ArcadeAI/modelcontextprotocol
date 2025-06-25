@@ -93,6 +93,7 @@ export const INVALID_REQUEST = -32600;
 export const METHOD_NOT_FOUND = -32601;
 export const INVALID_PARAMS = -32602;
 export const INTERNAL_ERROR = -32603;
+export const ELICITATION_REQUIRED = -32604; // TODO finalize error number
 
 /**
  * A response to a request that indicates an error occurred.

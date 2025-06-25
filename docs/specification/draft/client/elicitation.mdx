@@ -86,6 +86,9 @@ To request information from a user, servers send an `elicitation/create` request
 - `"form"` (default): In-band structured data collection with optional schema validation
 - `"oob"`: Out-of-band interaction via URL navigation
 
+The elicitation request **MAY** include a `correlatedRequestId` parameter that indicates
+the request is related to an earlier request (e.g. a failed tool call).
+
 #### Form Mode (In-Band)
 
 Form mode allows servers to collect structured data directly through the MCP client.
@@ -185,7 +188,9 @@ Form mode allows servers to collect structured data directly through the MCP cli
 
 #### Out-of-Band Mode
 
-Out-of-band mode enables servers to direct users to external URLs for interactions that should not pass through the MCP client. This is essential for OAuth flows, payment processing, and other security-sensitive operations.
+Out-of-band mode enables servers to direct users to external URLs for interactions that
+should not pass through the MCP client. This is essential for OAuth flows, payment
+processing, and other security-sensitive operations.
 
 **Request:**
 
@@ -197,7 +202,8 @@ Out-of-band mode enables servers to direct users to external URLs for interactio
   "params": {
     "mode": "oob",
     "url": "https://oauth.example.com/authorize?client_id=abc123&response_type=code&...",
-    "message": "Authorization is required to access your Example Co files."
+    "message": "Authorization is required to access your Example Co files.",
+    "correlatedRequestId": 2 // Optional
   }
 }
 ```
@@ -210,9 +216,10 @@ Out-of-band mode enables servers to direct users to external URLs for interactio
   "id": 3,
   "result": {
     "_meta": {
-      "progressToken": "oob-progress-456" // Client wants progress updates
+      "progressToken": "oob-progress-456" // Client wants progress updates (TODO needs to be a separate `elicitation/track` request?)
     },
-    "action": "accept"
+    "action": "accept",
+    "codeVerifier": "a1b2c3"
   }
 }
 ```
@@ -228,6 +235,57 @@ The server can then send [progress notifications](/docs/specification/draft/basi
     "progress": 100,
     "total": 100,
     "message": "Authorization completed successfully"
+  }
+}
+```
+
+For sensitive flows (e.g. authorization), the server **MAY** send the client an additional
+`elicitation/verify` request containing the request ID of an earlier elicitation request.
+
+The client **MUST** validate that it received the elicitation request with the given request ID, and respond accordingly:
+- Respond with `success` if the given request ID was received by this client, and the code verifier matches the cryptographic hash of the code
+- Respond with an error if the given request ID was NOT received by this client
+
+// TODO: Finish describing a PKCE-like challenge/verifier mechanism here,
+// so that the client knows something cryptographically that the server doesn't know.
+// I think it's necessary in chained scenarios like MCP client->MCP server 1->MCP server 2->...,
+// to avoid a malicious server in the middle spoofing the response to `/elicitation/verify`.
+
+**Confirm Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "elicitation/confirm",
+  "params": {
+    "confirmRequestId": 3,
+    "codeVerifier": "a1b2c3"
+  }
+}
+```
+
+**Response (Request ID Valid):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "confirmedRequestId": 3
+  }
+}
+```
+
+**Response (Request ID Invalid):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "error": {
+    "code": -32600,
+    "message": "Unknown elicitation request: 3"
   }
 }
 ```
@@ -296,7 +354,7 @@ sequenceDiagram
     Server->>Client: elicitation/create (mode: oob)
 
     Client->>User: Present consent to open URL
-    User-->>Client: Provide consent
+    User->>Client: Provide consent
 
     Client->>UserAgent: Open URL
     Client->>Server: Response (action: accept), with optional progressToken
@@ -304,18 +362,19 @@ sequenceDiagram
     Note over User,UserAgent: User interaction (e.g. OAuth flow)
     UserAgent-->>Server: Interaction complete
 
-    Server-->>Client: notifications/progress (optional)
+    Server->>Client: notifications/progress (optional)
 ```
 
-### Correlated Request Flow
+### Example: Elicitation Required for Tool Call
 
-TODO: I am not yet sure whether tools should error with a special field
-that indicates that elicitation is needed, or if the elicitation request should refer back
-to the failed tool call with a "correlation ID". Below is what Claude wrote as a first draft.
-We could also re-introduce the "interaction_required" error idea, but I wanted to see first
-if it was possible to do this with "pure" elicitation (no new mechanisms added).
+When an elicitation interaction is required as part of another request, the server **SHOULD**
+return error -32604 to indicate to the client that an elicitation message is expected.
+TODO: Finalize this error code and do a find-replace in the whole repo if it needs to change
 
-When an elicitation is needed in response to another request (e.g., a tool call requiring authorization):
+In subsequent elicitation message(s), the server **SHOULD** set the `correlatedRequestId`
+property to the JSON-RPC request ID of the original request.
+
+When an elicitation is needed in response to another request (e.g., a tool call requiring payment):
 
 ```mermaid
 sequenceDiagram
@@ -327,21 +386,75 @@ sequenceDiagram
     Client->>Server: tools/call (id: 123)
 
     Note over Server: Server needs authorization
-    Server->>Client: Error acknowledging need for auth
-    Server->>Client: elicitation/create (mode: oob, correlatedRequestId: 123)
+    Server->>Client: Error acknowledging need for auth (code: -32604)
+    Server->>Client: elicitation/create (id: 124, mode: oob, correlatedRequestId: 123)
+    Note over Client: Client associates elicitation request 124 with tool call 123
 
-    Client->>User: Present authorization request
-    User-->>Client: Consent
+    Client->>User: Present consent to open URL
+    User->>Client: Provide consent
 
-    Client->>UserAgent: Open authorization URL
-    Client->>Server: Response with progressToken
+    Client->>UserAgent: Open URL
+    Client->>Server: Response (action: accept), with optional progressToken
 
-    UserAgent-->>Server: Complete authorization
-    Server-->>Client: notifications/progress
+    Note over User,UserAgent: User interaction (e.g. OAuth flow)
+    UserAgent-->>Server: Interaction complete
 
-    Note over Client: Client can retry original request
-    Client->>Server: tools/call (id: 456, retry of 123)
-    Server->>Client: Success response
+    Server->>Client: notifications/progress (optional)
+
+    Client->>Server: Retry tools/call (optional)
+```
+
+TODO: I'm on the fence whether we should add an even more detailed example of doing downstream OAuth.
+I don't want to fixate the whole OOB section on OAuth, but it is the most-requested thing to do.
+We could keep it here, or alternatively move it to a new doc about "OAuth best practices" or even a blog post.
+Adding it below in case we decide to keep it:
+
+### Example: OAuth to Downstream Resource Server (TODO decide to keep?)
+
+A variation on the above example is downstream OAuth authorization for a tool or resource
+call.
+
+In this scenario, the MCP client acts as an OAuth 2.1 client to the MCP server (as
+described in [MCP authorization](/docs/specification/draft/basic/authorization.mdx)). The
+MCP server then acts as an OAuth client to a downstream (third-party) Authorization Server
+and Resource Server.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    participant User
+    participant UserAgent as User Agent
+    participant 3PAS as 3rd-party Authorization Server
+    participant 3PRS as 3rd-party Resource Server
+
+    Client->>Server: tools/call (id: 123)
+
+    Note over Server: Server needs authorization
+    Note over Server: Generate OAuth 2.1 authorization URL to downstream AS
+    Server->>Client: Error acknowledging need for auth (code: -32604)
+    Server->>Client: elicitation/create (id: 124, mode: oob, correlatedRequestId: 123)
+    Note over Client: Client associates elicitation request 124 with tool call 123
+
+    Client->>User: Present consent to open URL
+    User->>Client: Provide consent
+
+    Client->>UserAgent: Open URL
+    Client->>Server: Response (action: accept), with optional progressToken
+
+    UserAgent-->>3PAS: Redirect
+    Note over User,UserAgent,3PAS: OAuth flow
+    3PAS-->>Server: Callback
+    Server-->>3PAS: Token exchange (server acting as OAuth 2.1 client)
+    Note over Server: Server binds 3rd-party tokens to MCP user
+
+    Server->>Client: notifications/progress (optional)
+
+    Client->>Server: Retry tools/call (optional)
+    Note over Server: Retrieve 3rd-party tokens for MCP user
+    Server-->>3PRS: API request to resource server (server acting as OAuth 2.1 client)
+    3PRS-->>Server: API response
+    Server->>Client: Tool response
 ```
 
 ## Request Schema
@@ -437,6 +550,9 @@ For `oob` mode, the request parameters are:
 
 - `mode`: **MUST** be `"oob"`
 - `url`: **REQUIRED** - The URL that the user should navigate to
+// TODO: should it be `url` or `uri`? There was a question on 475 about other protocols like tel://
+// I am leaning towards `url` because then we can keep a clean MUST in Security Considerations about always requiring https://
+// My only sticking point is mobile app schemes - would being able to redirect to my-app:// be useful, or a bigger can of worms?
 - `message`: **OPTIONAL** - Human-readable explanation of why the interaction is needed
 
 Parameters **MUST NOT** include:
@@ -446,7 +562,9 @@ Parameters **MUST NOT** include:
 
 ## Response Actions
 
-Elicitation responses use a three-action model to clearly distinguish between different user actions. Additionally, responses **MAY** include a progress token to enable progress tracking for long-running operations.
+Elicitation responses use a three-action model to clearly distinguish between different user actions.
+
+Additionally, responses **MAY** include a progress token to enable progress tracking for long-running operations.
 
 ```json
 {
@@ -459,7 +577,18 @@ Elicitation responses use a three-action model to clearly distinguish between di
       "anotherProperty": 42
     },
     "_meta": {
-      "progressToken": "client-token-123" // Optional: enables progress tracking. TODO is this correct use of progress in a *response*?
+      "progressToken": "client-token-123" // Optional: enables progress tracking.
+      // TODO: According to a strict reading of the progress spec, this is incorrect(!)
+      // because this is a JSONRPCResponse.Result payload. While Result does contain a `_meta` key,
+      // `_meta.progressToken` is only defined on JSONRPCRequest, not JSONRPCResponse.Result
+      // We worked within the boundaries of a strict reading of the progress spec in the original
+      // UI PR 475 by introducing another request message, `interactions/track` so that the progressToken
+      // could be passed in a proper JSONRPCRequest.
+      // @ggoodman noted that this felt very inefficient (he's right). I still feel like this PR
+      // isn't the place to amend the progress spec, but maybe worth opening a discussion
+      // on the MCP github to see if there's an appetite for adding `_meta.progressToken` to JSONRPCResponse.Result
+      // Unless/until the progress spec is updated, I believe the correct spec-compliant thing to do here
+      // is to reintroduce something like `elicitations/track` :/
     }
   }
 }
@@ -509,38 +638,56 @@ This is particularly useful for out-of-band mode where the interaction is a disc
 
 ## Security Considerations
 
-1. Servers **MUST NOT** request sensitive information through form mode elicitation
+1. Clients **MUST** provide clear indication of which server is requesting information
 2. Clients **SHOULD** implement user approval controls
-3. Clients **SHOULD** provide clear indication of which server is requesting information
-4. Clients **SHOULD** allow users to reject elicitation requests at any time
-5. Clients **SHOULD** implement rate limiting
-6. Clients **SHOULD** present elicitation requests in a way that makes it clear what information is being requested and why
+3. Clients **SHOULD** allow users to reject elicitation requests at any time
+4. Clients **SHOULD** implement rate limiting
+5. Clients **SHOULD** present elicitation requests in a way that makes it clear what information is being requested and why
+
+### Identifying the User
+
+Servers **MUST NOT** rely on client-provided user identification, as this can be forged.
+Instead, servers **SHOULD** follow [security best practices](/specification/draft/basic/security_best_practices).
+
+Non-normative examples:
+- Incorrect: Treat user input like "I am joe@example.com" as authoritative
+- Correct: Rely on the [MCP authorization server](/docs/specification/draft/basic/authorization.mdx) to identify the user
 
 ### Form Mode Security
 
 1. Servers **MUST NOT** request sensitive information (passwords, API keys, etc.) via form mode
-2. URLs intended for user interaction **MUST NOT** appear in form mode messages or schemas
+2. Servers **MUST NOT** place URLs intended for user interaction in form mode messages or schemas
 3. Clients **SHOULD** validate all responses against the provided schema
 4. Servers **SHOULD** validate received data matches the requested schema
 
 ### Out-of-Band Mode Security
 
-TODO, whatever is not covered by the general security considerations above.
-TODO: OAuth-specific security considerations, specifically preventing phishing attacks (like COAT).
+1. Clients **MUST NOT** open a user agent (e.g. browser) without explicit consent from the user
 
 #### Server-Side Request Forgery (SSRF)
 
 Since clients open URLs provided by servers, they **MUST** implement SSRF protections:
 
 - Block requests to internal IP ranges (e.g., 127.0.0.1, 10.0.0.0/8, etc.)
-- Require HTTPS for all out-of-band URLs (no HTTP, file://, etc.)
-- Validate URL format before presenting to users
-- Apply rate limiting to prevent abuse
+- Require the `https://` scheme for all out-of-band URLs (no HTTP, file://, etc.)
+- Clearly render or distinguish Unicode characters (e.g. punycode URLs) to avoid "look-alike" misdirections
+- Clearly communicate the destination server and target URL to the user when asking for consent
 
-#### Identifying the User
+#### Phishing
 
-Servers **MUST NOT** rely on client-provided user identification, as this can be forged. Instead, servers **SHOULD**:
+One use of out of band elicitation is to perform OAuth flows where the server acts as an
+OAuth client of another resource server. In this case, the server generates an
+authorization URL to the third-party resource server and passes it to the client in the
+form of an `oob` elicitation request.
 
-- Generate secure session tokens for each interaction
-- Bind interactions to the MCP session
-- Implement proper authentication within the out-of-band flow
+Without proper mitigation, the following phishing attack is possible:
+1. A malicious user (Alice) connected to a benign server triggers an elicitation request
+2. The benign server generates an authorization URL, acting as an OAuth client of a third-party resource server
+3. Instead of clicking on the link, Alice tricks a victim user (Bob) of the same benign server into clicking it
+4. Bob follows the link and completes the authorization, thinking they are authorizing their own connection to the benign server
+5. The tokens for the third-party server are bound to Alice's session and identity, instead of Bob's, resulting in an account takeover
+
+To prevent this attack, the server **MUST**:
+- Send an `elicitation/verify` message after the out-of-band interaction is complete, but _before_ the elicitation interaction is considered complete
+- Bind out-of-band elicitation requests to the identity of the user, and ensure the `elicitation/verify` response is sent from the same identity // TODO might need to word better, what I really mean is "the Bearer token is for the same person"
+- Bind out-of-band elicitation requests to the MCP session, and ensure the `elicitation/verify` response belongs to the same session // TODO: Is this too narrow? Not all transports support sessions. What if the session expires too soon?
